@@ -7,6 +7,9 @@ STATE = "seen.json"
 MAX_PAGES = 2          # newest ~20 postings per check is plenty for a 15-minute window
 PAGE_SIZE = 10
 MAX_LISTED = 10        # jobs listed per notification before "+N more"
+# Only alert on postings whose location mentions one of these (case-insensitive).
+# Postings with no location info are kept so nothing is missed by accident.
+LOCATION_KEYWORDS = ["united states", "usa", "multiple locations"]
 TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 HEADERS = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -70,11 +73,22 @@ def normalize(p):
     jid = str(p.get("id") or p.get("displayJobId") or "")
     locs = p.get("locations") or p.get("standardizedLocations") or []
     if isinstance(locs, list):
+        full = "; ".join(str(x) for x in locs)
         locs = "; ".join(str(x) for x in locs[:3])
+    else:
+        full = str(locs)
     url = p.get("positionUrl") or f"/careers/job/{jid}"
     if url.startswith("/"):
         url = BASE + url
-    return {"id": jid, "title": p.get("name") or "Untitled", "loc": locs or "Location n/a", "url": url}
+    return {"id": jid, "title": p.get("name") or "Untitled", "loc": locs or "Location n/a",
+            "full_loc": full, "url": url}
+
+
+def wanted(job):
+    text = job["full_loc"].lower()
+    if not text.strip():
+        return True
+    return any(k in text for k in LOCATION_KEYWORDS)
 
 
 def load_state():
@@ -117,10 +131,12 @@ def main():
 
     first_run = not state["seen"]
     seen = set(state["seen"])
-    new = [j for j in jobs if j["id"] not in seen]
+    all_new = [j for j in jobs if j["id"] not in seen]
+    new = [j for j in all_new if wanted(j)]
+    print(f"{len(all_new)} new postings, {len(new)} match the location filter.")
 
     if first_run:
-        print(f"First run: recording {len(new)} current postings without alerting.")
+        print(f"First run: recording {len(all_new)} current postings without alerting.")
         notify("Microsoft job alerts are live", "Setup works. You'll be notified of every new posting from now on.")
     elif new:
         lines = [f"• <a href=\"{html.escape(j['url'], quote=True)}\">{html.escape(j['title'])}</a>"
@@ -134,7 +150,7 @@ def main():
         print("No new postings.")
 
     # oldest first so trimming keeps the newest IDs
-    state["seen"].extend(j["id"] for j in reversed(new))
+    state["seen"].extend(j["id"] for j in reversed(all_new))
     save_state(state)
 
 
