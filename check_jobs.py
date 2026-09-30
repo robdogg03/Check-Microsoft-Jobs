@@ -1,10 +1,10 @@
 """Alert on every new posting at Microsoft Careers via a Telegram bot."""
-import html, json, os, sys, urllib.request, urllib.parse, urllib.error
+import html, json, os, sys, time, urllib.request, urllib.parse, urllib.error
 
 BASE = "https://apply.careers.microsoft.com"
 SEARCH = BASE + "/api/pcsx/search"
 STATE = "seen.json"
-MAX_PAGES = 5          # newest ~50 postings per check is plenty for a 15-minute window
+MAX_PAGES = 2          # newest ~20 postings per check is plenty for a 15-minute window
 PAGE_SIZE = 10
 MAX_LISTED = 10        # jobs listed per notification before "+N more"
 TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
@@ -14,16 +14,30 @@ HEADERS = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
            "Accept": "application/json"}
 
 
-def http(url, data=None, headers=None, timeout=30):
-    req = urllib.request.Request(url, data=data, headers=headers or HEADERS)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.read()
+def http(url, data=None, headers=None, timeout=30, attempts=3):
+    """GET/POST with retries on rate limits (429) and server errors (5xx)."""
+    for i in range(attempts):
+        req = urllib.request.Request(url, data=data, headers=headers or HEADERS)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return r.read()
+        except urllib.error.HTTPError as e:
+            if e.code in (429, 500, 502, 503, 504) and i < attempts - 1:
+                wait = min(int(e.headers.get("Retry-After", 0) or 0) or 15 * (i + 1), 60)
+                print(f"HTTP {e.code}; retrying in {wait}s")
+                time.sleep(wait)
+                continue
+            raise
 
 
 def notify(title, body, click=None, priority="default"):
     """Send a Telegram message. `body` is HTML (callers must escape text)."""
     if not (TG_TOKEN and TG_CHAT):
         print("Telegram secrets not set; would send:", title, body)
+        return
+    if not (TG_TOKEN.isascii() and TG_CHAT.isascii()):
+        print("TELEGRAM secret contains a non-standard character (often a slashed zero "
+              "typed instead of 0). Re-copy the token/chat ID and re-save the secret.")
         return
     text = f"<b>{html.escape(title)}</b>\n{body}"
     data = urllib.parse.urlencode({"chat_id": TG_CHAT, "text": text, "parse_mode": "HTML",
@@ -43,6 +57,8 @@ def fetch_page(start):
 def fetch_recent():
     jobs = []
     for page in range(MAX_PAGES):
+        if page:
+            time.sleep(3)
         batch = fetch_page(page * PAGE_SIZE)
         if not batch:
             break
@@ -85,8 +101,9 @@ def main():
     except Exception as e:
         state["fails"] = state.get("fails", 0) + 1
         print("FAILED:", e)
-        # Alert on the first failure, then once a day (96 checks) if it persists
-        if state["fails"] == 1 or state["fails"] % 96 == 0:
+        # One-off errors (like a rate limit) are ignored; alert after 3 in a row (~45 min),
+        # then once a day if it persists
+        if state["fails"] == 3 or state["fails"] % 96 == 0:
             try:
                 notify("Job alert script is failing", html.escape(f"{e}\nNo alerts until it is fixed."))
             except Exception as ne:
@@ -94,7 +111,7 @@ def main():
         save_state(state)
         return
 
-    if state.get("fails"):
+    if state.get("fails", 0) >= 3:
         notify("Job alert script recovered", "Checks are working again.")
     state["fails"] = 0
 
